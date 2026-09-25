@@ -99,7 +99,9 @@ def _matrix_to_observable(flat_matrix, n):
     if next_pow2 != n:
         padded_mat = np.zeros((next_pow2, next_pow2))
         padded_mat[:n, :n] = mat
-        penalty = 10.0 * max(1.0, float(np.max(np.abs(mat))))
+        # Pad unused diagonal with Gershgorin bound so fake eigenvalues stay outside.
+        gershgorin = float(np.max(np.sum(np.abs(mat), axis=1)))
+        penalty = max(1.0, gershgorin)
         for i in range(n, next_pow2):
             padded_mat[i, i] = penalty
         mat = padded_mat
@@ -119,12 +121,12 @@ def _make_estimator(use_noise):
         from qiskit_ibm_runtime.fake_provider import FakeManilaV2
     except ImportError as exc:
         raise ImportError(
-            "Noisy QAOA requires qiskit-aer and qiskit-ibm-runtime. "
+            "Noisy solvers require qiskit-aer and qiskit-ibm-runtime. "
             "Install with: pip install qiskit-aer qiskit-ibm-runtime"
         ) from exc
 
     fake_backend = FakeManilaV2()
-    noise_model = NoiseModel.from_backend(fake_backend, warnings=False)
+    noise_model = NoiseModel.from_backend(fake_backend)
     aer_simulator = AerSimulator(noise_model=noise_model)
     pass_manager = generate_preset_pass_manager(
         optimization_level=1, backend=aer_simulator
@@ -147,21 +149,36 @@ def _expect_energy(estimator, circuit, observable, parameters):
     return float(np.real(evs[0]))
 
 
-def _energy_diff_uncertainty(circuit, parameters, observable, noisy_estimator):
-    exact_energy = _expect_energy(
-        StatevectorEstimator(), circuit, observable, parameters
+def _quantum_variance_std(estimator, circuit, observable, parameters, h_mean):
+    # Quantum std of H in this state: sqrt(max(0, <H^2> - <H>^2)).
+    h2 = _expect_energy(
+        estimator, circuit, observable @ observable, parameters
     )
-    noisy_energy = _expect_energy(
-        noisy_estimator, circuit, observable, parameters
-    )
-    # Predicted noise = |E_noisy - E_exact| on the final circuit
-    return abs(noisy_energy - exact_energy)
+    return float(np.sqrt(max(0.0, h2 - h_mean**2)))
 
 
-def run_vqd_eigensolver(flat_matrix, n, k=None):
+def _occupation_stds(estimator, circuit, parameters, n, next_pow2):
+    # Occupation std per component: sqrt(p (1 - p)) for basis outcome probability p.
+    stds = np.zeros(n, dtype=float)
+    for j in range(n):
+        proj = np.zeros((next_pow2, next_pow2), dtype=float)
+        proj[j, j] = 1.0
+        p_j = _expect_energy(
+            estimator, circuit, SparsePauliOp.from_operator(proj), parameters
+        )
+        p_j = min(1.0, max(0.0, p_j))
+        stds[j] = float(np.sqrt(max(0.0, p_j - p_j * p_j)))
+    return stds
+
+
+def run_vqd_eigensolver(flat_matrix, n, k=None, use_noise=False):
     """
     Takes a flat matrix of size n*n, and returns the lowest k eigenvalues
     and matching eigenvectors using VQD.
+
+    With use_noise=True, only the energy estimator is noisy (FakeManila);
+    VQD still recognizes distinct states perfectly.
+    Expect worse eigenvalues, especially for k > 1.
     """
     if k is None:
         k = n
@@ -172,9 +189,14 @@ def run_vqd_eigensolver(flat_matrix, n, k=None):
     num_qubits = int(np.log2(next_pow2))
 
     ansatz = EfficientSU2(num_qubits, reps=1, entanglement="linear")
-    optimizer = SLSQP(maxiter=1000, ftol=1e-9)
-    estimator = StatevectorEstimator()
+    estimator, pass_manager = _make_estimator(use_noise)
+    # Keep exact fidelity even under noise: overlaps stay exact; only energy
+    # is FakeManila-noisy (same demo style as QAOA).
     fidelity = _ExactStatevectorFidelity()
+    if use_noise:
+        optimizer = COBYLA(maxiter=50)
+    else:
+        optimizer = SLSQP(maxiter=1000, ftol=1e-9)
 
     # Overlap weights on the scale of the original matrix, not the padding.
     beta = 10.0 * max(
@@ -191,7 +213,18 @@ def run_vqd_eigensolver(flat_matrix, n, k=None):
                 rng.uniform(-np.pi, np.pi, ansatz.num_parameters)
             )
 
-    vqd = VQD(estimator, fidelity, ansatz, optimizer, k=k, betas=betas)
+    if use_noise:
+        vqd = VQD(
+            estimator,
+            fidelity,
+            ansatz,
+            optimizer,
+            k=k,
+            betas=betas,
+            transpiler=pass_manager,
+        )
+    else:
+        vqd = VQD(estimator, fidelity, ansatz, optimizer, k=k, betas=betas)
     vqd.initial_point = initial_points
 
     result = vqd.compute_eigenvalues(observable)
@@ -199,13 +232,38 @@ def run_vqd_eigensolver(flat_matrix, n, k=None):
     eigenvalues = [float(np.real(e)) for e in result.eigenvalues]
     eigenvectors = np.zeros((n, n), dtype=float)
     for i in range(k):
+        optimal_circuit = result.optimal_circuits[i]
+        optimal_parameters = result.optimal_points[i]
         eigenvectors[:, i] = _statevector_to_real_eigenvector(
-            result.optimal_circuits[i], result.optimal_points[i], n
+            optimal_circuit, optimal_parameters, n
         )
-    uq_values = [0.0] * len(eigenvalues)
-    uq_vectors = [0.0] * (n * n)
 
-    return eigenvalues, eigenvectors.ravel().tolist(), uq_values, uq_vectors
+    uq_values = [0.0] * len(eigenvalues)
+    uq_vectors = np.zeros((n, n), dtype=float)
+    for i in range(k):
+        optimal_circuit = result.optimal_circuits[i]
+        optimal_parameters = result.optimal_points[i]
+        uq_values[i] = _quantum_variance_std(
+            estimator,
+            optimal_circuit,
+            observable,
+            optimal_parameters,
+            eigenvalues[i],
+        )
+        uq_vectors[:, i] = _occupation_stds(
+            estimator,
+            optimal_circuit,
+            optimal_parameters,
+            n,
+            next_pow2,
+        )
+
+    return (
+        eigenvalues,
+        eigenvectors.ravel().tolist(),
+        uq_values,
+        uq_vectors.ravel().tolist(),
+    )
 
 
 def run_qaoa_eigensolver(flat_matrix, n, use_noise=False, reps=3):
@@ -213,7 +271,7 @@ def run_qaoa_eigensolver(flat_matrix, n, use_noise=False, reps=3):
     Takes a flat matrix of size n*n, and returns the ground eigenvalue,
     and matching eigenvector using QAOA.
     """
-    observable, _ = _matrix_to_observable(flat_matrix, n)
+    observable, next_pow2 = _matrix_to_observable(flat_matrix, n)
     ansatz = QAOAAnsatz(observable, reps=reps)
     estimator, pass_manager = _make_estimator(use_noise)
     if use_noise:
@@ -227,44 +285,87 @@ def run_qaoa_eigensolver(flat_matrix, n, use_noise=False, reps=3):
 
     result = vqe.compute_minimum_eigenvalue(observable)
 
+    optimal_circuit = result.optimal_circuit
+    optimal_parameters = result.optimal_point
+
     eigenvalues = [float(np.real(result.eigenvalue))]
     eigenvectors = np.zeros((n, n), dtype=float)
     eigenvectors[:, 0] = _statevector_to_real_eigenvector(
-        result.optimal_circuit, result.optimal_point, n
+        optimal_circuit, optimal_parameters, n
     )
 
     uq_values = [0.0] * len(eigenvalues)
-    uq_vectors = [0.0] * (n * n)
-    if use_noise:
-        uq_values[0] = _energy_diff_uncertainty(
-            result.optimal_circuit, result.optimal_point, observable, estimator
-        )
+    uq_vectors = np.zeros((n, n), dtype=float)
+    uq_values[0] = _quantum_variance_std(
+        estimator,
+        optimal_circuit,
+        observable,
+        optimal_parameters,
+        eigenvalues[0],
+    )
+    uq_vectors[:, 0] = _occupation_stds(
+        estimator,
+        optimal_circuit,
+        optimal_parameters,
+        n,
+        next_pow2,
+    )
 
-    return eigenvalues, eigenvectors.ravel().tolist(), uq_values, uq_vectors
+    return (
+        eigenvalues,
+        eigenvectors.ravel().tolist(),
+        uq_values,
+        uq_vectors.ravel().tolist(),
+    )
 
 
 # Quick Test
 if __name__ == "__main__":
     # The same 3x3 matrix from the C++ test file
     test_matrix = [3.0, 5.0, 2.0, 5.0, 1.0, 3.0, 2.0, 3.0, 2.0]
-    values, vectors = run_vqd_eigensolver(test_matrix, 3)
-    print(f"VQD Eigenvalues: {values}")
-    print(f"VQD Eigenvectors: {vectors}")
+
+    print("=== VQD (noiseless) ===")
+    values, vectors, vqd_uq_v, vqd_uq_vec = run_vqd_eigensolver(test_matrix, 3)
+    print(f"Eigenvalues: {values}")
+    print(f"Eigenvectors: {vectors}")
+    print(f"uq_values: {vqd_uq_v}")
+    print(f"uq_vectors: {vqd_uq_vec}")
+
+    try:
+        print("\n=== VQD (noise) ===")
+        (
+            vqd_noisy_values,
+            vqd_noisy_vectors,
+            vqd_noisy_uq_v,
+            vqd_noisy_uq_vec,
+        ) = run_vqd_eigensolver(test_matrix, 3, use_noise=True)
+        print(f"Eigenvalues: {vqd_noisy_values}")
+        print(f"Eigenvectors: {vqd_noisy_vectors}")
+        print(f"uq_values: {vqd_noisy_uq_v}")
+        print(f"uq_vectors: {vqd_noisy_uq_vec}")
+    except ImportError as exc:
+        print(f"Skipping noisy VQD demo: {exc}")
+
+    print("\n=== QAOA (noiseless) ===")
     qaoa_values, qaoa_vectors, qaoa_uq_v, qaoa_uq_vec = run_qaoa_eigensolver(
         test_matrix, 3
     )
-    print(f"QAOA Eigenvalue: {qaoa_values}")
-    print(f"QAOA Eigenvector: {qaoa_vectors}")
-    print(f"QAOA uq_values: {qaoa_uq_v}")
+    print(f"Eigenvalue: {qaoa_values}")
+    print(f"Eigenvector: {qaoa_vectors}")
+    print(f"uq_values: {qaoa_uq_v}")
+    print(f"uq_vectors: {qaoa_uq_vec}")
+
     try:
+        print("\n=== QAOA (noise) ===")
         (
             qaoa_noisy_values,
             qaoa_noisy_vectors,
             noisy_uq_v,
             noisy_uq_vec,
         ) = run_qaoa_eigensolver(test_matrix, 3, use_noise=True)
-        print(f"QAOA Eigenvalue (noise): {qaoa_noisy_values}")
-        print(f"QAOA Eigenvector (noise): {qaoa_noisy_vectors}")
-        print(f"QAOA uq_values (noise): {noisy_uq_v}")
+        print(f"Eigenvalue: {qaoa_noisy_values}")
+        print(f"Eigenvector: {qaoa_noisy_vectors}")
+        print(f"uq_values: {noisy_uq_v}")
+        print(f"uq_vectors: {noisy_uq_vec}")
     except ImportError as exc:
         print(f"Skipping noisy QAOA demo: {exc}")

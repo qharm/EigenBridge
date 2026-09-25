@@ -18,11 +18,33 @@
 
 There are two quantum solvers. VQD can return several eigenvalues; QAOA returns only the ground state.
 
-VQD -> `run_vqd_eigensolver(matrix, k)` -> `solve_vqd` -> lowest `k` eigenvalues (`k` defaults to all)
-QAOA -> `run_qaoa_eigensolver(matrix, use_noise=false)` -> `solve_qaoa` -> ground state only
+VQD -> `run_vqd_eigensolver(matrix, k, use_noise=false)` -> lowest `k` eigenvalues (`k` defaults to all)
+QAOA -> `run_qaoa_eigensolver(matrix, use_noise=false)` -> ground state only
 
 **Uncertainties (`uq_values` / `uq_vectors`)**
-- Noiseless solvers (LAPACK, VQD, noiseless QAOA): `uq_* = 0`
-- Noisy QAOA (`use_noise=true`): at the final circuit, `uq_values[0] = |E_noisy − E_exact|`; Unused slots and `uq_vectors` stay 0
+- For every VQD/QAOA path (noiseless and noisy), at each final optimized circuit/state,
+  `uq_values[i] = sqrt(max(0, ⟨H²⟩ − ⟨H⟩²))`, where ⟨H⟩ is the reported eigenvalue and ⟨H²⟩
+  comes from the same estimator on `H @ H` at the same parameters.
+  This is the standard deviation of a single measurement of H in the prepared state
+  (intrinsic quantum / variational residual variance).
+  Exact eigenstates give σ ≈ 0; approximate ansatz states give nonzero σ even without noise.
+- `uq_vectors` uses the same layout as the returned eigenvectors (column `i` = mode `i`).
+  For each physical basis index `j`,
+  `uq_vectors[j, i] = sqrt(p_j (1 − p_j))` where `p_j = ⟨|j⟩⟨j|⟩` is evaluated with the
+  **same estimator / circuit / parameters** as the energy (FakeManila when `use_noise=true`).
+  This is the std of a single-shot computational-basis occupation measurement for component `j`.
+  Caveat: it can be > 0 even for an exact delocalized eigenstate (unlike σ_H, which is 0 for
+  exact energy eigenstates). It is **not** “distance to the classical eigenvector.”
+  Unused eigenvector columns stay 0. Reported eigenvectors still come from the ideal
+  statevector of the optimized circuit; only the UQ uses the estimator/noise path.
+- Non–power-of-2 dimensions pad to the next power of two and place
+  `penalty = max(1.0, Gershgorin row-sum bound)` on unused diagonal entries so pad
+  eigenvalues stay outside the original spectrum while avoiding the old 10× entry-scale
+  inflation of ⟨H²⟩ on small problems.
+- Noisy VQD keeps exact statevector overlaps; only the energy / projector estimator uses
+  FakeManila noise (demo). Expect worse eigenvalues, especially for higher states.
 
-The noisy QAOA unit test checks that `uq_values[0] = |E_noisy − E_exact|` (at the final circuit) and `|λ_noisy − λ_LAPACK|` agree within a factor of 10 (ratio < 10).
+Unit tests check that reported `uq_values` / filled `uq_vectors` entries are finite and
+nonnegative (filled columns not identically zero on the demo matrix), and that on the
+demo 3×3 matrix the ground-state interval `[⟨H⟩−σ, ⟨H⟩+σ]` contains the classical ground
+eigenvalue for noisy paths. They do not require noisy eigenvalues to match the classical answer.
